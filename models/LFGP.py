@@ -79,8 +79,76 @@ class AEF(nn.Module):
         k_high_max = int(high_k_all.max().item())
 
         big_neg = -1e9
-        energy_low = energy_per_freq.masked_fill(~low_mask, big_neg)
-        energy_high = energy_per_freq.masked_fill(~high_mask, big_neg)
+
+        # Vectorized patch entropy using prefix sums. The low- and high-
+        # frequency candidate regions are divided independently into
+        # consecutive patches of three bins.
+        patch_size = 3
+        batch_size, freq_bins = energy_per_freq.shape
+        freq_index = torch.arange(freq_bins, device=device).unsqueeze(0)
+        low_length = low_mask.sum(dim=1, keepdim=True)
+
+        region_start = torch.where(
+            low_mask,
+            torch.zeros_like(low_length),
+            low_length
+        )
+        region_end = torch.where(
+            low_mask,
+            low_length,
+            torch.full_like(low_length, freq_bins)
+        )
+        patch_start = (
+            region_start
+            + ((freq_index - region_start) // patch_size) * patch_size
+        )
+        patch_end = torch.minimum(patch_start + patch_size, region_end)
+        patch_count = patch_end - patch_start
+
+        # For p_k = E_k / sum(E), use the equivalent entropy expression
+        # H = log(sum(E)) - sum(E * log(E)) / sum(E). Prefix sums provide
+        # each bin's patch statistics without Python loops or scatter_add_.
+        zero_column = energy_per_freq.new_zeros(batch_size, 1)
+        energy_prefix = torch.cat(
+            [zero_column, torch.cumsum(energy_per_freq, dim=1)], dim=1
+        )
+        energy_log_energy = energy_per_freq * torch.log(
+            energy_per_freq + EPS
+        )
+        energy_log_prefix = torch.cat(
+            [zero_column, torch.cumsum(energy_log_energy, dim=1)], dim=1
+        )
+
+        patch_energy = (
+            energy_prefix.gather(1, patch_end)
+            - energy_prefix.gather(1, patch_start)
+        )
+        patch_energy_log_energy = (
+            energy_log_prefix.gather(1, patch_end)
+            - energy_log_prefix.gather(1, patch_start)
+        )
+        patch_entropy = (
+            torch.log(patch_energy + EPS)
+            - patch_energy_log_energy / (patch_energy + EPS)
+        )
+
+        normalized_entropy = patch_entropy / (
+            torch.log(patch_count.to(energy_per_freq.dtype).clamp(min=2.0))
+            + EPS
+        )
+        # A one-bin remainder patch has H = 0 and concentration C = 1.
+        normalized_entropy = torch.where(
+            patch_count > 1,
+            normalized_entropy,
+            torch.zeros_like(normalized_entropy)
+        )
+        concentration = (1.0 - normalized_entropy).clamp(0.0, 1.0)
+
+        # Entropy-aware selection score: G = E * (1 - normalized entropy).
+        selection_score = energy_per_freq * concentration
+
+        energy_low = selection_score.masked_fill(~low_mask, big_neg)
+        energy_high = selection_score.masked_fill(~high_mask, big_neg)
 
         _, low_idx = torch.topk(energy_low, k_low_max, dim=1)
         _, high_idx = torch.topk(energy_high, k_high_max, dim=1)
@@ -98,6 +166,7 @@ class AEF(nn.Module):
 
         return freq_band_mask
 
+    @torch.no_grad()
     def adaptive_mask(self, x_freq):
         B, N, freq_bins = x_freq.shape
         device = x_freq.device
@@ -106,7 +175,9 @@ class AEF(nn.Module):
         
         knee_indices = self._compute_kneepoint(energy_per_freq, freq_bins, device)
         low_mask, high_mask = self._create_frequency_masks(knee_indices, freq_bins, device)
-        freq_band_mask = self._select_top_frequencies(energy_per_freq, low_mask, high_mask, device)
+        freq_band_mask = self._select_top_frequencies(
+            energy_per_freq, low_mask, high_mask, device
+        )
 
         return freq_band_mask
 
@@ -163,16 +234,18 @@ class CAP(nn.Module):
         self.time_proj = nn.Linear(self.seq_len, self.pred_len)
         
         self.global_rs_enc = nn.Sequential(
-            nn.Linear(self.ksh, self.enc_in // self.rda), 
+            nn.Linear(self.ksh, self.enc_in // self.rda),
             nn.LayerNorm(self.enc_in // self.rda),
             nn.ReLU(),
-            nn.Linear(self.enc_in // self.rda, self.enc_in // self.rdb), 
+            nn.Linear(self.enc_in // self.rda, self.enc_in // self.rdb),
             nn.LayerNorm(self.enc_in // self.rdb),
             nn.ReLU(),
-            nn.Conv1d(in_channels=self.seq_len, 
-                     out_channels=self.seq_len, 
-                     kernel_size=self.ksize, 
-                     padding='same'),
+            nn.Conv1d(
+                in_channels=self.seq_len,
+                out_channels=self.seq_len,
+                kernel_size=self.ksize,
+                padding='same'
+            ),
             nn.Linear(self.enc_in // self.rdb, self.enc_in),
         )
         
@@ -180,13 +253,15 @@ class CAP(nn.Module):
         B, L, N = x.shape
         
         global_rs_embed = self.global_rs_enc(share_signal)
-        
+
         specific_signal_reshaped = specific_signal.reshape(B, L, N, self.ksp)
-        specific_signal_conv = specific_signal_reshaped.permute(0, 2, 3, 1).reshape(B * N, self.ksp, L)
-        
+        specific_signal_conv = specific_signal_reshaped.permute(
+            0, 2, 3, 1
+        ).reshape(B * N, self.ksp, L)
         channel_fused_conv = self.channel_fusion(specific_signal_conv)
         channel_fused = channel_fused_conv.reshape(B, N, L).permute(0, 2, 1)
-        
+
+        # Full CAP combines shared/global and channel-specific representations.
         time_embed = global_rs_embed + channel_fused
         time_out = self.time_proj(time_embed.transpose(1, 2)).transpose(1, 2)
         
@@ -225,13 +300,11 @@ class Model(nn.Module):
         
         z = self.revin_layer(x, 'norm')
         z_trans = z.transpose(1, 2)
-        
         freq_pred = self.freq_branch(z_trans)
         
         B, L, N = x.shape
         share_signal = share_signal.reshape(B, L, -1)
         specific_signal = specific_signal.reshape(B, L, -1)
-        
         time_pred = self.time_branch(x, share_signal, specific_signal)
         
         final_pred = self.beta * freq_pred + (1 - self.beta) * time_pred
